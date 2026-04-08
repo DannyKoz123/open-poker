@@ -138,7 +138,7 @@ of truth.
 | HTTP server      | adapter-node + custom entry (planned)   | Self-hosted, no platform lock-in                          |
 | Persistence      | `better-sqlite3` (planned)              | Single-file embedded, WAL mode, sub-millisecond writes    |
 | Reverse proxy    | Caddy (planned)                         | Auto-TLS, transparent WebSocket upgrade                   |
-| Deploy target    | Hetzner VPS (planned)                   | Bare metal vibes, full control, cheap forever             |
+| Deploy target    | OVH VPS Value, Hillsboro OR (planned)   | Same provider lichess runs on, sub-15ms from PNW, ~$10/mo |
 
 The "planned" rows are the work the [Roadmap](#roadmap) section covers.
 
@@ -254,7 +254,8 @@ order, smallest to largest, so every step is independently shippable:
    single HTTP server. Dev/prod parity, one port.
 9. Introduce the `RoomDirectory` interface and a trivial `LocalDirectory`
    stub. Pure seam, no behavior today.
-10. Hetzner deploy. Caddy with auto-TLS and a per-IP rate limit on
+10. OVH deploy. Provision an OVH VPS Value in `us-west-or-1` (Hillsboro,
+    OR), stock Debian 12. Caddy with auto-TLS and a per-IP rate limit on
     `POST /api/rooms`. systemd unit. SQLite at
     `/var/lib/open-poker/rooms.db`. First real deployment.
 11. `docs/scaling.md` documenting the multi-node upgrade path: which
