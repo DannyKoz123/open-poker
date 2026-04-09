@@ -14,7 +14,7 @@ hand to showdown → verify UI state matches server state.
 **Why:** The `test/crash-recovery.test.ts` subprocess test covers the server
 contract for crash recovery and H1/H2/H3. It does NOT cover the browser
 client behavior: localStorage `playerSecret` persistence, WS reconnect
-logic, game UI rendering, chat UX, or any client-side bugs.
+logic, game UI rendering, room and table UX, or any client-side bugs.
 
 **Pros:** Catches client-side regressions. Real integration coverage.
 Documents the intended user flow as executable spec.
@@ -59,6 +59,38 @@ silent data-loss bug into a loud operational alert.
 
 **Depends on / blocked by:** `RoomRehydrator` must be built first (step 7
 of the design doc Next Steps).
+
+---
+
+## 4. Mid-hand `sitPlayer` guard
+
+**What:** Add a "cannot sit during a hand" guard to
+`src/lib/server/room/Room.ts` `sitPlayer()` (around line 136), mirroring
+the existing guard in `standPlayer()` at line 159. A player trying to
+take a seat while `this.gameState !== null` should receive an error and
+stay unseated until the next hand starts.
+
+**Why:** Real cardrooms always make new players wait for the next hand.
+More concretely for this repo: the `PersistedEvent.hand-started` payload
+is intended to record the exact set of players in the hand, including
+their seat indices and starting stacks. If a player can sit down mid-hand,
+`this.seats` drifts from the snapshot captured at hand-start, and the
+invariant "hand-started.players is stable for the lifetime of a hand"
+breaks in a non-obvious way.
+
+**Pros:** One-line fix. Removes a subtle inconsistency. Makes the PHH
+serializer's assumption (stable per-hand player list) actually true at
+the engine level, not just by lucky timing.
+
+**Cons:** None.
+
+**Context:** Surfaced during the 2026-04-08 plan-eng-review of the PHH
+TS serializer design. Not bundled into the PHH PR because PHH only reads
+`hand-started` events, which are written once at hand start — mid-hand
+joiners don't corrupt the PHH output directly. It's a latent engine bug.
+Fix alongside the next Room-touching change, or standalone.
+
+**Depends on / blocked by:** Nothing.
 
 ---
 
