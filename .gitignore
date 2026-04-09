@@ -21,3 +21,9 @@ Thumbs.db
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Third-party reference repos cloned for local reading (not vendored code).
+# See reference/README.md for the convention. The README itself is tracked;
+# everything else under reference/ is ignored.
+/reference/*
+!/reference/README.md
