@@ -2,17 +2,31 @@
   import { goto } from '$app/navigation';
 
   let playerName = $state('');
+  let creatingRoom = $state(false);
+  let createError = $state('');
 
-  function createRoom() {
-    const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
-    let id = '';
-    const bytes = new Uint8Array(6);
-    crypto.getRandomValues(bytes);
-    for (const byte of bytes) {
-      id += chars[byte % chars.length];
+  async function createRoom() {
+    if (creatingRoom) return;
+
+    creatingRoom = true;
+    createError = '';
+
+    try {
+      const response = await fetch('/api/rooms', { method: 'POST' });
+      if (!response.ok) {
+        throw new Error(`Failed to create room (${response.status})`);
+      }
+
+      const data = await response.json() as { roomId: string };
+      const name = playerName.trim() || 'Anonymous';
+
+      goto(`/game/${data.roomId}?name=${encodeURIComponent(name)}`);
+    } catch (error) {
+      createError = 'Could not create a room. Try again.';
+      console.error(error);
+    } finally {
+      creatingRoom = false;
     }
-    const name = playerName.trim() || 'Anonymous';
-    goto(`/game/${id}?name=${encodeURIComponent(name)}`);
   }
 </script>
 
@@ -30,16 +44,21 @@
       bind:value={playerName}
       placeholder="Your name"
       maxlength="20"
-      onkeydown={(e) => e.key === 'Enter' && createRoom()}
+      onkeydown={(e) => e.key === 'Enter' && void createRoom()}
     />
-    <button onclick={createRoom}>Create Table</button>
+    <button onclick={() => void createRoom()} disabled={creatingRoom}>
+      {creatingRoom ? 'Creating...' : 'Create Table'}
+    </button>
   </div>
 
-  <p class="hint">Share the link with friends to play together.</p>
+  <p class="hint">No signup. Public hand replay is planned. The engine is already live.</p>
+  {#if createError}
+    <p class="error">{createError}</p>
+  {/if}
 
   <footer>
-    <a href="https://github.com/open-poker/open-poker" target="_blank">GitHub</a>
     <span>AGPL-3.0</span>
+    <span>Free forever, no money play</span>
   </footer>
 </div>
 
@@ -109,23 +128,30 @@
     background: #c73e54;
   }
 
+  button:disabled {
+    opacity: 0.7;
+    cursor: wait;
+  }
+
   .hint {
     color: #666;
     margin-top: 1rem;
     font-size: 0.85rem;
   }
 
-  footer {
-    position: fixed;
-    bottom: 1rem;
-    display: flex;
-    gap: 1rem;
-    color: #555;
-    font-size: 0.8rem;
+  .error {
+    color: #ff9aa8;
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
   }
 
-  footer a {
-    color: #888;
-    text-decoration: none;
+  footer {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    color: #555;
+    font-size: 0.8rem;
+    margin-top: 2rem;
   }
 </style>

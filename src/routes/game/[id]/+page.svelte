@@ -1,8 +1,8 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { browser } from '$app/environment';
-  import type { ServerMessage, RoomInfo } from '$lib/types/messages';
-  import type { GameState, AvailableActions, Card, Phase } from '$lib/types/poker';
+  import type { ClientMessage, ServerMessage, RoomInfo } from '$lib/types/messages';
+  import type { GameState, AvailableActions, Card, ActionType } from '$lib/types/poker';
 
   let ws: WebSocket | null = null;
   let playerId = $state('');
@@ -10,8 +10,6 @@
   let room = $state<RoomInfo | null>(null);
   let gameState = $state<GameState | null>(null);
   let availableActions = $state<AvailableActions | null>(null);
-  let chatMessages = $state<{ name: string; text: string }[]>([]);
-  let chatInput = $state('');
   let raiseAmount = $state(0);
   let connected = $state(false);
   let seated = $state(false);
@@ -78,9 +76,6 @@
         }
         showWinners = false;
         break;
-      case 'chat':
-        chatMessages = [...chatMessages.slice(-50), { name: msg.name, text: msg.text }];
-        break;
       case 'hand-complete':
         winners = msg.winners;
         showWinners = true;
@@ -93,7 +88,7 @@
     }
   }
 
-  function send(msg: any) {
+  function send(msg: ClientMessage) {
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
@@ -103,14 +98,8 @@
     send({ type: 'sit', seatIndex });
   }
 
-  function doAction(type: string, amount?: number) {
+  function doAction(type: ActionType, amount?: number) {
     send({ type: 'action', action: type, amount });
-  }
-
-  function sendChat() {
-    if (!chatInput.trim()) return;
-    send({ type: 'chat', text: chatInput.trim() });
-    chatInput = '';
   }
 
   function startGame() {
@@ -128,10 +117,6 @@
 
   function isMyTurn(): boolean {
     return availableActions !== null;
-  }
-
-  function getMyPlayer() {
-    return gameState?.players.find(p => p.id === playerId);
   }
 
   function seatedPlayerCount(): number {
@@ -290,7 +275,7 @@
       {/if}
     </div>
 
-    <!-- Sidebar: chat + info -->
+    <!-- Sidebar: room info -->
     <div class="sidebar">
       <div class="room-info">
         <span class="room-id">Room: {roomId}</span>
@@ -299,21 +284,30 @@
         </button>
       </div>
 
-      <div class="chat">
-        <div class="chat-messages">
-          {#each chatMessages as msg}
-            <div class="chat-msg"><b>{msg.name}:</b> {msg.text}</div>
-          {/each}
-        </div>
-        <div class="chat-input">
-          <input
-            type="text"
-            bind:value={chatInput}
-            placeholder="Chat..."
-            maxlength="200"
-            onkeydown={(e) => e.key === 'Enter' && sendChat()}
-          />
-        </div>
+      <div class="panel">
+        <h3>Table Notes</h3>
+        <ul>
+          <li>No signup required.</li>
+          <li>Free forever, no money play.</li>
+          <li>Public hand replay is planned after persistence lands.</li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Status</h3>
+        <ul>
+          <li>Connection: {connected ? 'connected' : 'reconnecting'}</li>
+          <li>Blinds: {room?.smallBlind ?? 5}/{room?.bigBlind ?? 10}</li>
+          <li>Seats taken: {seatedPlayerCount()} / {room?.maxSeats ?? 9}</li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Next major build</h3>
+        <p>
+          Event-sourced room storage, reconnect auth, and permanent hand URLs are the next
+          architectural milestones.
+        </p>
       </div>
     </div>
   </div>
@@ -608,6 +602,7 @@
     display: flex;
     flex-direction: column;
     background: #16213e;
+    overflow-y: auto;
   }
 
   .room-info {
@@ -633,38 +628,29 @@
     font-size: 0.75rem;
   }
 
-  .chat {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+  .panel {
+    padding: 0.9rem 0.75rem;
+    border-bottom: 1px solid #253250;
   }
 
-  .chat-messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 0.5rem;
-    font-size: 0.8rem;
+  .panel h3 {
+    margin: 0 0 0.6rem;
+    font-size: 0.9rem;
+    color: #f1f3f8;
   }
 
-  .chat-msg {
-    margin-bottom: 0.3rem;
-    word-break: break-word;
-  }
-
-  .chat-input {
-    padding: 0.5rem;
-    border-top: 1px solid #333;
-  }
-
-  .chat-input input {
-    width: 100%;
-    padding: 0.5rem;
-    border: 1px solid #333;
-    border-radius: 4px;
-    background: #1a1a2e;
-    color: #fff;
+  .panel ul {
+    margin: 0;
+    padding-left: 1rem;
+    color: #aeb7c6;
     font-size: 0.85rem;
-    box-sizing: border-box;
+    line-height: 1.45;
+  }
+
+  .panel p {
+    margin: 0;
+    color: #aeb7c6;
+    font-size: 0.85rem;
+    line-height: 1.45;
   }
 </style>
