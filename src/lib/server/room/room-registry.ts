@@ -1,12 +1,14 @@
 import { generateReadableRoomId } from '../../ids/room-id';
-import { Room } from './Room';
+import { getCompletedHandStore } from '../store/completed-hand-store';
+import { Room, type RoomOptions } from './Room';
 
 const rooms = new Map<string, Room>();
+const completedHandStore = getCompletedHandStore();
 
 export function getOrCreateRoom(id: string): Room {
   let room = rooms.get(id);
   if (!room) {
-    room = new Room(id);
+    room = new Room(id, { completedHandStore });
     rooms.set(id, room);
   }
   return room;
@@ -20,10 +22,10 @@ export function deleteRoom(id: string): void {
   rooms.delete(id);
 }
 
-export function createRoom(id = generateReadableRoomId()): Room {
+export function createRoom(options: RoomOptions = {}, id = generateReadableRoomId()): Room {
   let room = rooms.get(id);
   if (!room) {
-    room = new Room(id);
+    room = new Room(id, { ...options, completedHandStore });
     rooms.set(id, room);
   }
   return room;

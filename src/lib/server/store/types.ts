@@ -36,3 +36,45 @@ export interface RoomStore {
   loadLatestSnapshot(roomId: string): Promise<RoomSnapshot | null>;
   listActiveRooms(): Promise<string[]>;
 }
+
+export interface PersistedHandPlayer {
+  playerId: string;
+  name: string;
+  seatIndex: number;
+  startingChips: number;
+  endingChips: number | null;
+}
+
+export interface PersistedHandAction {
+  seq: number;
+  ts: number;
+  action: Action;
+}
+
+export interface PersistedHandWinner {
+  playerId: string;
+  amount: number;
+  description?: string;
+}
+
+export interface PersistedHandRecord {
+  schemaVersion: 1;
+  handId: string;
+  roomId: string;
+  maxSeats: number;
+  startedAt: number;
+  completedAt: number | null;
+  smallBlind: number;
+  bigBlind: number;
+  players: PersistedHandPlayer[];
+  initialState: GameState;
+  actions: PersistedHandAction[];
+  finalState: GameState | null;
+  winners: PersistedHandWinner[];
+}
+
+export interface CompletedHandStore {
+  saveInProgressHand(hand: PersistedHandRecord): void;
+  saveCompletedHand(hand: PersistedHandRecord): void;
+  loadCompletedHand(handId: string): PersistedHandRecord | null;
+}

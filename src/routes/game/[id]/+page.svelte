@@ -1,7 +1,10 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { browser } from '$app/environment';
+  import { formatStakePair, formatChips, centsToDollars, dollarsToCents } from '$lib/chips';
+  import { resolvePlayerIdentity } from '$lib/identity/device';
   import type { ClientMessage, ServerMessage, RoomInfo } from '$lib/types/messages';
+  import type { AccountIdentity } from '$lib/types/identity';
   import type { GameState, AvailableActions, Card, ActionType } from '$lib/types/poker';
 
   let ws: WebSocket | null = null;
@@ -14,31 +17,60 @@
   let connected = $state(false);
   let seated = $state(false);
   let winners = $state<{ playerId: string; amount: number; description?: string }[]>([]);
+  let lastCompletedHandId = $state<string | null>(null);
   let showWinners = $state(false);
+  let identityReady = $state(false);
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   const roomId = $derived(page.params.id);
+  const authAccount = $derived((page.data.auth?.account as AccountIdentity | null | undefined) ?? null);
+  let activeIdentityKey = '';
 
   $effect(() => {
     if (!browser) return;
 
-    playerId = sessionStorage.getItem('playerId') || crypto.randomUUID();
-    sessionStorage.setItem('playerId', playerId);
-
     const urlName = new URL(window.location.href).searchParams.get('name');
-    playerName = urlName || sessionStorage.getItem('playerName') || '';
+    const identity = resolvePlayerIdentity(authAccount, urlName);
+    const identityKey = `${identity.playerId}:${identity.playerName}`;
 
-    if (playerName) {
-      sessionStorage.setItem('playerName', playerName);
+    playerId = identity.playerId;
+    playerName = identity.playerName;
+    identityReady = true;
+
+    if (identityKey !== activeIdentityKey) {
+      activeIdentityKey = identityKey;
       connect();
     }
+
+    return () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        const existing = ws;
+        ws = null;
+        existing.onclose = null;
+        existing.close();
+      }
+    };
   });
 
   function connect() {
+    if (!playerId || !playerName) return;
+
     if (ws) {
       const old = ws;
+      ws = null;
       old.onclose = null;
       old.close();
     }
+
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
     // In dev mode, WS server runs on a separate port
     const isDev = window.location.port === '5173';
     const wsHost = isDev ? `${window.location.hostname}:5174` : window.location.host;
@@ -58,7 +90,7 @@
 
     ws.onclose = () => {
       connected = false;
-      setTimeout(connect, 2000);
+      reconnectTimer = setTimeout(connect, 2000);
     };
   }
 
@@ -77,6 +109,7 @@
         showWinners = false;
         break;
       case 'hand-complete':
+        lastCompletedHandId = msg.handId;
         winners = msg.winners;
         showWinners = true;
         gameState = null;
@@ -102,6 +135,33 @@
     send({ type: 'action', action: type, amount });
   }
 
+  function clampRaise(value: number): number {
+    if (!availableActions) return value;
+    return Math.max(
+      availableActions.minRaise,
+      Math.min(availableActions.maxRaise, Math.round(value))
+    );
+  }
+
+  function setRaise(value: number) {
+    raiseAmount = clampRaise(value);
+  }
+
+  // Pot-fraction raise-to amount. pots[].amount already includes live bets
+  // from the current round (the engine accumulates into pot[0] on every
+  // bet/call/raise), so we must NOT add currentBet sums on top.
+  // Pot-sized raise = the increment on top of a call equals the pot after calling.
+  function potRaiseTo(fraction: number): number {
+    if (!gameState || !availableActions) return 0;
+    const pot = gameState.pots.reduce((s, p) => s + p.amount, 0);
+    return gameState.currentBet + fraction * (pot + availableActions.callAmount);
+  }
+
+  function submitRaise() {
+    if (!availableActions) return;
+    doAction('raise', clampRaise(raiseAmount));
+  }
+
   function startGame() {
     send({ type: 'start-game' });
   }
@@ -123,12 +183,8 @@
     return room?.seats.filter(s => s !== null).length || 0;
   }
 
-  // Ask for name if not set
-  let nameInput = $state('');
-  function submitName() {
-    playerName = nameInput.trim() || 'Anonymous';
-    sessionStorage.setItem('playerName', playerName);
-    connect();
+  function handReplayHref(handId: string): string {
+    return `/hand/${encodeURIComponent(handId)}`;
   }
 </script>
 
@@ -136,17 +192,10 @@
   <title>Open Poker - Table {roomId}</title>
 </svelte:head>
 
-{#if !playerName}
+{#if !identityReady}
   <div class="name-prompt">
-    <h2>Join Table</h2>
-    <input
-      type="text"
-      bind:value={nameInput}
-      placeholder="Your name"
-      maxlength="20"
-      onkeydown={(e) => e.key === 'Enter' && submitName()}
-    />
-    <button onclick={submitName}>Join</button>
+    <h2>Loading table</h2>
+    <p>Restoring your identity on this device.</p>
   </div>
 {:else}
   <div class="game-layout">
@@ -162,7 +211,7 @@
           {/if}
           {#if gameState}
             <div class="pot-display">
-              Pot: {gameState.pots.reduce((s, p) => s + p.amount, 0)}
+              Pot: {formatChips(gameState.pots.reduce((s, p) => s + p.amount, 0))}
             </div>
           {/if}
         </div>
@@ -172,7 +221,7 @@
           <div class="winners-overlay">
             {#each winners as w}
               <div class="winner-line">
-                {room?.seats.find(s => s?.playerId === w.playerId)?.name || 'Unknown'} wins {w.amount}
+                {room?.seats.find(s => s?.playerId === w.playerId)?.name || 'Unknown'} wins {formatChips(w.amount)}
                 {#if w.description} with {w.description}{/if}
               </div>
             {/each}
@@ -193,7 +242,7 @@
             >
               {#if seat}
                 <div class="seat-name">{seat.name}</div>
-                <div class="seat-chips">{gamePlayer?.chips ?? seat.chips}</div>
+                <div class="seat-chips">{formatChips(gamePlayer?.chips ?? seat.chips)}</div>
                 {#if gamePlayer?.holeCards}
                   <div class="hole-cards">
                     {#each gamePlayer.holeCards as card}
@@ -207,7 +256,7 @@
                   </div>
                 {/if}
                 {#if gamePlayer && gamePlayer.currentBet > 0}
-                  <div class="bet-amount">{gamePlayer.currentBet}</div>
+                  <div class="bet-amount">{formatChips(gamePlayer.currentBet)}</div>
                 {/if}
                 {#if gameState && gameState.dealerIndex === gameState.players.indexOf(gamePlayer!)}
                   <div class="dealer-button">D</div>
@@ -233,32 +282,61 @@
           {/if}
           {#if availableActions.canCall}
             <button class="action-btn call" onclick={() => doAction('call')}>
-              Call {availableActions.callAmount}
+              Call {formatChips(availableActions.callAmount)}
             </button>
           {/if}
           {#if availableActions.canRaise}
+            {@const raiseActions = availableActions}
             <div class="raise-control">
-              <input
-                type="range"
-                min={availableActions.minRaise}
-                max={availableActions.maxRaise}
-                bind:value={raiseAmount}
-              />
-              <button class="action-btn raise" onclick={() => doAction('raise', raiseAmount)}>
-                Raise to {raiseAmount}
-              </button>
+              <div class="preset-row">
+                <button class="preset-btn" onclick={() => setRaise(raiseActions.minRaise)}>
+                  Min
+                </button>
+                <button class="preset-btn" onclick={() => setRaise(potRaiseTo(0.5))}>
+                  ½ Pot
+                </button>
+                <button class="preset-btn" onclick={() => setRaise(potRaiseTo(0.75))}>
+                  ¾ Pot
+                </button>
+                <button class="preset-btn" onclick={() => setRaise(potRaiseTo(1))}>
+                  Pot
+                </button>
+                <button class="preset-btn" onclick={() => setRaise(raiseActions.maxRaise)}>
+                  All In
+                </button>
+              </div>
+              <div class="amount-row">
+                <input
+                  type="range"
+                  min={raiseActions.minRaise}
+                  max={raiseActions.maxRaise}
+                  bind:value={raiseAmount}
+                />
+                <input
+                  type="number"
+                  class="amount-input"
+                  min={centsToDollars(raiseActions.minRaise)}
+                  max={centsToDollars(raiseActions.maxRaise)}
+                  step="0.01"
+                  value={centsToDollars(raiseAmount)}
+                  onchange={(e) => setRaise(dollarsToCents(parseFloat(e.currentTarget.value) || 0))}
+                />
+                <button class="action-btn raise" onclick={submitRaise}>
+                  Raise to {formatChips(clampRaise(raiseAmount))}
+                </button>
+              </div>
             </div>
           {/if}
           {#if availableActions.canAllIn}
             <button class="action-btn allin" onclick={() => doAction('all-in')}>
-              All In {availableActions.allInAmount}
+              All In {formatChips(availableActions.allInAmount)}
             </button>
           {/if}
         </div>
       {/if}
 
       <!-- Start game / waiting -->
-      {#if !gameState && seated}
+      {#if !gameState && seated && !showWinners}
         <div class="waiting">
           {#if seatedPlayerCount() >= 2}
             <button class="start-btn" onclick={startGame}>Deal Cards</button>
@@ -270,7 +348,12 @@
 
       {#if showWinners && !gameState}
         <div class="waiting">
-          <button class="start-btn" onclick={startGame}>Next Hand</button>
+          <div class="waiting-actions">
+            <button class="start-btn" onclick={startGame}>Next Hand</button>
+            {#if lastCompletedHandId}
+              <a class="replay-btn" href={handReplayHref(lastCompletedHandId)}>Open replay route</a>
+            {/if}
+          </div>
         </div>
       {/if}
     </div>
@@ -287,25 +370,35 @@
       <div class="panel">
         <h3>Table Notes</h3>
         <ul>
-          <li>No signup required.</li>
+          <li>Anonymous identity is saved on this device.</li>
+          <li>Accounts are optional and sync identity across devices.</li>
           <li>Free forever, no money play.</li>
-          <li>Public hand replay is planned after persistence lands.</li>
+          <li>Completed hands now carry stable IDs for replay and PHH routes.</li>
         </ul>
       </div>
 
       <div class="panel">
         <h3>Status</h3>
         <ul>
+          <li>Identity: {authAccount ? `@${authAccount.username}` : playerName}</li>
           <li>Connection: {connected ? 'connected' : 'reconnecting'}</li>
-          <li>Blinds: {room?.smallBlind ?? 5}/{room?.bigBlind ?? 10}</li>
+          <li>Blinds: {room ? formatStakePair(room.smallBlind, room.bigBlind) : '—'}</li>
           <li>Seats taken: {seatedPlayerCount()} / {room?.maxSeats ?? 9}</li>
+          <li>
+            Latest hand:
+            {#if lastCompletedHandId}
+              <a class="status-link" href={handReplayHref(lastCompletedHandId)}>{lastCompletedHandId}</a>
+            {:else}
+              —
+            {/if}
+          </li>
         </ul>
       </div>
 
       <div class="panel">
         <h3>Next major build</h3>
         <p>
-          Event-sourced room storage, reconnect auth, and permanent hand URLs are the next
+          Permanent hand replay, PHH export, and fuller reconnect hardening are the next
           architectural milestones.
         </p>
       </div>
@@ -331,24 +424,9 @@
     gap: 1rem;
   }
 
-  .name-prompt input {
-    padding: 0.75rem 1rem;
-    border: 1px solid #333;
-    border-radius: 8px;
-    background: #16213e;
-    color: #fff;
-    font-size: 1rem;
-  }
-
-  .name-prompt button {
-    padding: 0.75rem 2rem;
-    border: none;
-    border-radius: 8px;
-    background: #e94560;
-    color: #fff;
-    font-size: 1rem;
-    font-weight: 600;
-    cursor: pointer;
+  .name-prompt p {
+    margin: 0;
+    color: #9aa6c2;
   }
 
   .game-layout {
@@ -571,8 +649,40 @@
 
   .raise-control {
     display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .preset-row {
+    display: flex;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .preset-btn {
+    padding: 0.35rem 0.65rem;
+    border: 1px solid #3a4766;
+    border-radius: 6px;
+    background: #1e2a44;
+    color: #e0e0e0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .preset-btn:hover {
+    border-color: #e94560;
+    color: #fff;
+  }
+
+  .amount-row {
+    display: flex;
     align-items: center;
     gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
   }
 
   .raise-control input[type="range"] {
@@ -580,9 +690,37 @@
     accent-color: #e94560;
   }
 
+  .amount-input {
+    width: 80px;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid #3a4766;
+    border-radius: 6px;
+    background: #16213e;
+    color: #fff;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-align: right;
+    appearance: textfield;
+    -moz-appearance: textfield;
+  }
+
+  .amount-input::-webkit-outer-spin-button,
+  .amount-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
   .waiting {
     margin-top: 1rem;
     text-align: center;
+  }
+
+  .waiting-actions {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
   }
 
   .start-btn {
@@ -594,6 +732,23 @@
     font-size: 1rem;
     font-weight: 600;
     cursor: pointer;
+  }
+
+  .replay-btn {
+    padding: 0.75rem 1.1rem;
+    border: 1px solid #3a4766;
+    border-radius: 8px;
+    background: #16213e;
+    color: #d7deea;
+    font-size: 0.95rem;
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .replay-btn:hover,
+  .status-link:hover {
+    color: #fff;
+    border-color: #e94560;
   }
 
   .sidebar {
@@ -645,6 +800,12 @@
     color: #aeb7c6;
     font-size: 0.85rem;
     line-height: 1.45;
+  }
+
+  .status-link {
+    color: #f0c66e;
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
   }
 
   .panel p {

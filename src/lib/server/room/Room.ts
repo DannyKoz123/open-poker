@@ -1,6 +1,9 @@
 import type { GameState, Action } from '../../types/poker';
 import type { ClientMessage, ServerMessage, RoomInfo, SeatInfo } from '../../types/messages';
 import { createHand, applyAction, getAvailableActions, getPlayerView } from '../../engine/game';
+import type { HostSession } from '../host/HostSession';
+import type { CompletedHandStore, PersistedHandRecord, PersistedHandWinner } from '../store/types';
+import { NOOP_COMPLETED_HAND_STORE } from '../store/completed-hand-store';
 
 interface ConnectedPlayer {
   id: string;
@@ -10,26 +13,45 @@ interface ConnectedPlayer {
   disconnectedAt: number | null;
 }
 
-const STARTING_CHIPS = 1000;
+const BUY_IN_BIG_BLINDS = 100;
 const RECONNECT_GRACE_MS = 30_000;
 const TURN_TIMER_MS = 30_000;
 const MAX_SEATS = 9;
+
+export interface RoomOptions {
+  smallBlind?: number;
+  bigBlind?: number;
+  completedHandStore?: CompletedHandStore;
+}
 
 export class Room {
   id: string;
   players: Map<string, ConnectedPlayer> = new Map();
   seats: (string | null)[] = new Array(MAX_SEATS).fill(null);
-  smallBlind = 5;
-  bigBlind = 10;
+  smallBlind: number;
+  bigBlind: number;
+  startingChips: number;
   dealerIndex = 0;
   gameState: GameState | null = null;
   chipStacks: Map<string, number> = new Map();
   turnTimer: ReturnType<typeof setTimeout> | null = null;
   actionQueue: (() => void)[] = [];
   processing = false;
+  private readonly completedHandStore: CompletedHandStore;
+  private currentHandRecord: PersistedHandRecord | null = null;
+  /** Optional callback invoked after each hand completes (used by HostSession). */
+  onHandComplete?: () => void;
+  /** Optional override for RoomInfo host fields (set by HostSession). */
+  roomInfoOverrides?: () => Partial<RoomInfo>;
+  /** Attached HostSession, if this room is host-controlled. */
+  hostSession?: HostSession;
 
-  constructor(id: string) {
+  constructor(id: string, options: RoomOptions = {}) {
     this.id = id;
+    this.smallBlind = options.smallBlind ?? 5;
+    this.bigBlind = options.bigBlind ?? 10;
+    this.startingChips = this.bigBlind * BUY_IN_BIG_BLINDS;
+    this.completedHandStore = options.completedHandStore ?? NOOP_COMPLETED_HAND_STORE;
   }
 
   handleConnection(ws: WebSocket, playerId: string) {
@@ -66,11 +88,11 @@ export class Room {
     // Ignore close events from stale connections (player already reconnected on a new socket)
     if (player.ws !== disconnectedWs) return;
 
-    if (player.seatIndex !== null && this.gameState) {
-      // In a game: start disconnect grace timer
+    // Grant grace period if seated during a hand, OR if a host session is active
+    // (host mode keeps players alive between hands for the session duration)
+    const needsGrace = (player.seatIndex !== null && this.gameState) || this.hostSession;
+    if (needsGrace) {
       player.disconnectedAt = Date.now();
-      // If it's their turn, the turn timer handles auto-fold
-      // If not their turn, the reconnect timer will kick them after 30s
       setTimeout(() => {
         const p = this.players.get(playerId);
         if (p && p.disconnectedAt !== null) {
@@ -82,7 +104,8 @@ export class Room {
     }
   }
 
-  private enqueue(fn: () => void) {
+  /** Schedule an action on the serial queue. Public for HostSession integration. */
+  enqueue(fn: () => void) {
     this.actionQueue.push(fn);
     if (!this.processing) this.processQueue();
   }
@@ -136,6 +159,10 @@ export class Room {
   private sitPlayer(playerId: string, seatIndex: number) {
     const player = this.players.get(playerId);
     if (!player) return;
+    if (this.gameState) {
+      this.sendTo(playerId, { type: 'error', message: 'Cannot sit during a hand' });
+      return;
+    }
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) {
       this.sendTo(playerId, { type: 'error', message: 'Invalid seat' });
       return;
@@ -150,7 +177,7 @@ export class Room {
     this.seats[seatIndex] = playerId;
     player.seatIndex = seatIndex;
     if (!this.chipStacks.has(playerId)) {
-      this.chipStacks.set(playerId, STARTING_CHIPS);
+      this.chipStacks.set(playerId, this.startingChips);
     }
     this.broadcast({ type: 'player-sat', playerId, seatIndex });
     this.broadcastRoomState();
@@ -182,6 +209,7 @@ export class Room {
         amount,
       };
       this.gameState = applyAction(this.gameState, action);
+      this.recordHandAction(action);
       this.clearTurnTimer();
 
       if (this.gameState.phase === 'hand-complete') {
@@ -207,7 +235,7 @@ export class Room {
     const players = seatedPlayers.map(({ playerId }) => ({
       id: playerId,
       name: this.players.get(playerId)!.name,
-      chips: this.chipStacks.get(playerId) || STARTING_CHIPS,
+      chips: this.chipStacks.get(playerId) || this.startingChips,
     }));
 
     // Find dealer index within seated players
@@ -220,12 +248,15 @@ export class Room {
       this.chipStacks.set(p.id, p.chips);
     }
 
+    this.beginHandPersistence(seatedPlayers, players);
     this.startTurnTimer();
     this.broadcastGameState();
   }
 
   private handleHandComplete() {
     if (!this.gameState) return;
+
+    const handId = this.gameState.handId;
 
     // Update chip stacks
     for (const p of this.gameState.players) {
@@ -238,8 +269,9 @@ export class Room {
       description: w.hand?.description,
     }));
 
+    this.completeHandPersistence(winners);
     this.broadcastGameState();
-    this.broadcast({ type: 'hand-complete', winners });
+    this.broadcast({ type: 'hand-complete', handId, winners });
 
     // Advance dealer
     this.dealerIndex = (this.dealerIndex + 1) % this.getSeatedPlayers().length;
@@ -247,6 +279,9 @@ export class Room {
     // Clear game state so next hand can start
     this.gameState = null;
     this.broadcastRoomState();
+
+    // Notify HostSession if registered
+    this.onHandComplete?.();
   }
 
   private removePlayer(playerId: string) {
@@ -290,6 +325,89 @@ export class Room {
     }
   }
 
+  // --- Hand persistence ---
+
+  private beginHandPersistence(
+    seatedPlayers: { playerId: string; seatIndex: number }[],
+    startingPlayers: { id: string; name: string; chips: number }[],
+  ) {
+    if (!this.gameState) return;
+
+    const startingStacks = new Map(startingPlayers.map(player => [player.id, player]));
+    this.currentHandRecord = {
+      schemaVersion: 1,
+      handId: this.gameState.handId,
+      roomId: this.id,
+      maxSeats: MAX_SEATS,
+      startedAt: Date.now(),
+      completedAt: null,
+      smallBlind: this.smallBlind,
+      bigBlind: this.bigBlind,
+      players: seatedPlayers.map(({ playerId, seatIndex }) => {
+        const startingPlayer = startingStacks.get(playerId);
+        return {
+          playerId,
+          name: startingPlayer?.name ?? this.players.get(playerId)?.name ?? 'Unknown',
+          seatIndex,
+          startingChips: startingPlayer?.chips ?? this.startingChips,
+          endingChips: null,
+        };
+      }),
+      initialState: structuredClone(this.gameState),
+      actions: [],
+      finalState: null,
+      winners: [],
+    };
+
+    this.persistInProgressHand('hand start');
+  }
+
+  private recordHandAction(action: Action) {
+    if (!this.currentHandRecord) return;
+
+    this.currentHandRecord.actions.push({
+      seq: this.currentHandRecord.actions.length + 1,
+      ts: Date.now(),
+      action: { ...action },
+    });
+
+    this.persistInProgressHand(`action ${action.type}`);
+  }
+
+  private completeHandPersistence(winners: PersistedHandWinner[]) {
+    if (!this.currentHandRecord || !this.gameState) return;
+
+    for (const persistedPlayer of this.currentHandRecord.players) {
+      const finalPlayer = this.gameState.players.find(player => player.id === persistedPlayer.playerId);
+      persistedPlayer.endingChips = finalPlayer?.chips ?? null;
+    }
+
+    this.currentHandRecord.completedAt = Date.now();
+    this.currentHandRecord.finalState = structuredClone(this.gameState);
+    this.currentHandRecord.winners = winners.map(winner => ({ ...winner }));
+
+    try {
+      this.completedHandStore.saveCompletedHand(this.currentHandRecord);
+    } catch (error) {
+      console.error(`Failed to persist completed hand ${this.currentHandRecord.handId}:`, error);
+    } finally {
+      this.currentHandRecord = null;
+    }
+  }
+
+  private persistInProgressHand(reason: string) {
+    if (!this.currentHandRecord) return;
+
+    try {
+      this.completedHandStore.saveInProgressHand(this.currentHandRecord);
+    } catch (error) {
+      console.error(
+        `Failed to persist ${reason} for hand ${this.currentHandRecord.handId}:`,
+        error,
+      );
+    }
+  }
+
   // --- Broadcasting ---
 
   private sendTo(playerId: string, msg: ServerMessage) {
@@ -323,7 +441,8 @@ export class Room {
     this.sendTo(playerId, { type: 'game-state', state: view, availableActions });
   }
 
-  private broadcastRoomState() {
+  /** Broadcast room state to all players. Public for HostSession integration. */
+  broadcastRoomState() {
     const room = this.getRoomInfo();
     this.broadcast({ type: 'room-state', room });
   }
@@ -336,18 +455,23 @@ export class Room {
       return {
         playerId,
         name: player.name,
-        chips: this.chipStacks.get(playerId) || STARTING_CHIPS,
+        chips: this.chipStacks.get(playerId) || this.startingChips,
       };
     });
 
-    return {
+    const base: RoomInfo = {
       id: this.id,
       seats,
       maxSeats: MAX_SEATS,
       smallBlind: this.smallBlind,
       bigBlind: this.bigBlind,
       gameInProgress: this.gameState !== null,
+      hostId: null,
+      sessionPhase: null,
     };
+
+    // Merge host overrides if a HostSession is attached
+    return this.roomInfoOverrides ? { ...base, ...this.roomInfoOverrides() } : base;
   }
 
   private getSeatedPlayers(): { playerId: string; seatIndex: number }[] {
